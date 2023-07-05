@@ -61,11 +61,15 @@ csrtick:  equ       0xFFE5              ; Internal counter
 iplmode:  equ       0xFFEC
 iplfdc:   equ       0xAA
 iplhdc:   equ       0xE8
+iplide:   equ       0x69
 iplhcca:  equ       0x55
 
 warmflag: equ       0xFFFE
 warmlo:   equ       0xA5
 warmhi:   equ       0x5A
+
+id_base:  equ       0xC0
+
 
 ; ============================================================================
 ; Entry point from reset.
@@ -128,8 +132,8 @@ entry4:   jp        bootany             ; Try each boot device in turn.
 entry5:   dec       c                   ; Read the key
           in        a, (c)
           inc       c
-          cp        0x95                ; Reset code?
-          jr        z, entry3
+          bit       7,a                 ; Not a key?
+          jr        nz, entry3
           cp        0x1B                ; ESC?
           jr        nz, entry4          ; No, continue to normal boot process
           call      setwarm
@@ -665,12 +669,15 @@ bootany:  ld        a, (warmflag)       ; Warm boot?
           jr        z, bootany2         ; Try floppy first.
           cp        iplhdc              ; Winchester?
           jr        z, bootany3         ; Skip floppy check.
+	  cp        iplide              ; NABU-IDE?
+	  jr        z, bootany4         ; Skip all but IDE and cable  
           cp        iplhcca             ; Cable?  If so, skip drive checks.
-          jr        z, bootany4         ; FALL INTO
+          jr        z, bootany5         ; FALL INTO
 bootany1: call      setwarm
 bootany2: call      fdseek
 bootany3: call      hdseek
-bootany4: jp        tryhcca
+bootany4: call      findide
+bootany5: jp        tryhcca
 
 ; ----------------------------------------------------------------------------
 ; Cold boot POST: make sure the RAM is working, or die screaming.
@@ -774,6 +781,8 @@ menu:     ld        hl, bootmsg
           jr        z, .menu3
           cp        'C'                 ; Cable
           jr        z, .menu4
+	  cp        'I'
+	  jr        z, .menu5
           call      bell
           jr        .menu1
 .menu2:   call      .confirm
@@ -784,6 +793,10 @@ menu:     ld        hl, bootmsg
           jr        err
 .menu4:   call      .confirm
           jp        tryhcca             ; Will fall into err anyway
+.menu5:	  call      .confirm
+          call      findide
+	  jr        err
+          
 
 .confirm: call      putch               ; Display our choice
           ld        a, 0x0D             ; Followed by a CRLF
@@ -1061,6 +1074,108 @@ hdwait:   in        a, (c)
           ret
 
 ; ============================================================================
+; NABU-IDE Bootloader code
+; We will attempt to load sector 0 of the master IDE device. If the loaded
+; block starts with 0x1806, then we will jump to it.
+; This code could be a lot simpler, but I don't feel like burning multiple
+; ROMs to test it.
+; ============================================================================
+
+	; Select master
+findide:ld	a,0xE0	
+	out	(id_base+0xC),a
+	ld	b,10
+	call	id_stal
+	in	a,(id_base+0xC)
+	and	0xF0
+	cp	0xE0
+	ret	nz
+	
+	; Set warm boot
+	ld	a,iplide
+	ld	(iplmode),a
+
+	; Set up registers
+	xor	a
+	out	(id_base+0x6),a
+	out	(id_base+0x8),a
+	out	(id_base+0xA),a
+	inc	a
+	out	(id_base+0x4),a
+	ld	hl,0xC000
+
+	; Read physical
+	call	id_rphy
+
+	; Check magic
+	ld	hl,(0xC000)
+	ld	de,0x0618
+	or	a
+	sbc	hl,de
+	ret	nz
+
+	jp	0xC000
+	
+; Executes a read command
+; hl = Destination of data
+;
+; Returns hl += 512
+; uses: af, bc, d, hl
+id_rphy:call	id_busy
+	ld	a,0x20
+	call	id_comm
+	call	id_wdrq
+	ld	d,0
+	ld	c,id_base
+id_rph0:ini
+	inc	c
+	ini
+	dec	c
+	dec	d
+	jr	nz,id_rph0
+	call	id_busy
+	ret
+
+; Waits for a DRQ (Data Request)
+;
+; uses: af
+id_wdrq:in	a,(id_base+0xE)
+	bit	3,a
+	jr	z,id_wdrq
+	ret
+	
+; Issues an IDE command
+; a = Command to issue
+;
+; uses: af
+id_comm:push	af
+	call	id_busy
+	pop	af
+	out	(id_base+0xE),a
+	ret
+	
+	
+; Waits for the IDE drive to no longer be busy
+;
+; Resets flag z on error
+id_busy:in	a,(id_base+0xE)
+	bit	6,a
+	jr	z,id_busy
+	bit	7,a
+	jr	nz,id_busy
+	bit	0,a
+	ret
+
+
+; Waits a little bit
+;
+; uses: b
+id_stal:push	bc
+	pop	bc
+	djnz	id_stal
+	ret
+
+; ============================================================================
 ; The Initial Program Loader (cable modem component).
 ; Many error and continuity checks have been scuttled in the name of speed.
 ; Pack $000001 is loaded into memory at address $140D, then entered at $1410,
@@ -1259,10 +1374,10 @@ rdhcca2:  push      bc                  ; Save retry count
           ret       z
           jp        err
 
-banner:   db        "OpenNabu IPL v0.6.3 30-APR-23", 0
+banner:   db        "OpenNabu IPL v0.6.3.A 05-JUL-23", 0
 bootmsg:  db        13, 10
           db        "Select boot device", 13, 10
-          db        "[(F)loppy disk, (H)ard disk, (C)able]: ", 0
+          db        "[(F)DC, (H)ard disk, (I)DE, (C)able]: ", 0
 errmsg:   db        13, 10
           db        "Boot failed", 13, 10, 0
 ramok:    db        "64K OK", 13, 10, 0
